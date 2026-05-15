@@ -105,13 +105,19 @@ async def llm_cognition(query: str, state: CityState, llm) -> UrbanTask:
                     "UrbanAgent 元认知 G2。用户请求与状态摘要如下。只输出 JSON："
                     "intent, entities(object 含 incident_id), constraints(array of {name, kind, expression}), "
                     "missing_information(array), rationale。\n"
+                    "missing_information 只在『无法从请求或状态中确定 incident_id』时才填写；"
+                    "若 incident_id 已知，请返回空数组——下游会根据资源是否存在自行降级，不需要在此阻塞。\n"
                     f"请求:\n{query}\n\n状态:\n{json.dumps(brief, ensure_ascii=False, indent=2)}"
                 ),
             )
         ],
         temperature=0.1,
         max_tokens=2048,
-        system="Return strict JSON only. Do not invent incident_id not in state.",
+        system=(
+            "Return strict JSON only. Do not invent incident_id not in state. "
+            "missing_information must be empty when incident_id is resolvable; "
+            "it is not a wish list for extra context."
+        ),
     )
     data = try_loads_json_object(resp.content)
     constraints = [
@@ -125,11 +131,28 @@ async def llm_cognition(query: str, state: CityState, llm) -> UrbanTask:
     ]
     if not constraints:
         raise ValueError("LLM cognition returned no constraints")
+    entities = dict(data.get("entities", {}))
+    incident_id_raw = entities.get("incident_id")
+    incident_id = str(incident_id_raw).strip() if incident_id_raw else ""
+    if not incident_id:
+        incident_id = _extract_incident_id(query) or ""
+        if incident_id:
+            entities["incident_id"] = incident_id
+    known_incident = (
+        next((i for i in state.incidents if i.id == incident_id), None)
+        if incident_id
+        else None
+    )
+    missing: list[str] = []
+    if not incident_id:
+        missing.append("incident_id")
+    elif known_incident is None:
+        missing.append(f"known incident {incident_id}")
     return UrbanTask(
         intent=str(data.get("intent", "fire_emergency_dispatch")).strip(),
-        entities=dict(data.get("entities", {})),
+        entities=entities,
         constraints=constraints,
-        missing_information=[str(x) for x in data.get("missing_information", []) if str(x).strip()],
+        missing_information=missing,
         rationale=str(data.get("rationale", "")).strip(),
         source="llm",
     )
