@@ -1,12 +1,4 @@
-"""Errors raised by the UrbanAgent method pipeline."""
-
-
-class UrbanAgentPipelineError(RuntimeError):
-    """Cognition or planning failed and no rule-based fallback is allowed."""
-
-    def __init__(self, stage: str, message: str) -> None:
-        self.stage = stage
-        super().__init__(f"[UrbanAgent:{stage}] {message}")
+"""Errors raised by UrbanAgent integrations."""
 
 
 class SandboxWireError(RuntimeError):

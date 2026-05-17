@@ -20,6 +20,8 @@ def batch_criteria_met(
     """All steps reached a non-rejected terminal status."""
 
     del state  # unused under protocol v1.0; kept for signature compatibility
+    if not actions:
+        return False
     if len(results) != len(actions):
         return False
     return all(r.status in {"accepted", "applied"} for r in results)
@@ -36,6 +38,16 @@ async def execute_batch_ordered(
     del max_poll_rounds, poll_interval_s  # protocol v1.0 confirms via command_status
     per_step: list[ActionResult] = []
     notes: list[str] = []
+    if not actions:
+        final_state = await sandbox.get_state()
+        return BatchOutcome(
+            batch_id=batch_id,
+            per_step_results=[],
+            polling_iterations=0,
+            criteria_satisfied=False,
+            final_state=final_state,
+            notes=["no executable actions produced by multi-agent planning"],
+        )
     for action in actions:
         result = await sandbox.send_action(action)
         per_step.append(result)

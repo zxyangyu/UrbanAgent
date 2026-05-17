@@ -9,7 +9,7 @@ from urbanagent.llm.types import Message
 from urbanagent.multiagent.llm_json import try_loads_json_object
 from urbanagent.multiagent.schemas import ActionDraft, SubAgentRole, SubGoal, SubPlan
 from urbanagent.multiagent.subagents.base import SubAgent
-from urbanagent.types import CityState, UrbanAction
+from urbanagent.types import CityState, UrbanAction, UrbanResource
 
 
 def _state_snippet(state: CityState, incident_id: str) -> dict[str, Any]:
@@ -301,14 +301,70 @@ def _action_priority(action: UrbanAction) -> tuple[int, str]:
 
 
 def merge_fire_suppression_from_policy(state, dispatch_policy) -> list[UrbanAction]:
-    """Meta supplements subagents: fire trucks from deterministic dispatch (subagents do not own fire)."""
+    """Meta supplements subagents with CarlaBridge-compatible fire response."""
     from urbanagent.dispatch import assignment_to_action
 
     plan = dispatch_policy.create_plan(state)
+    resources = {r.id: r for r in state.resources}
     out: list[UrbanAction] = []
     for a in plan.assignments:
         if a.role == "fire_suppression":
-            out.append(assignment_to_action(a))
+            action = assignment_to_action(a)
+            out.append(action)
+            resource = resources.get(a.resource_id)
+            if _needs_explicit_extinguish_step(resource):
+                out.append(
+                    UrbanAction(
+                        kind="dispatch_vehicle",
+                        target_id=a.resource_id,
+                        destination=a.destination,
+                        parameters={
+                            "incident_id": a.incident_id,
+                            "role": "fire_suppression",
+                            "intent": "extinguish",
+                            "capability": "fire_suppression",
+                            "force_extinguish": True,
+                        },
+                        reason=(
+                            "Follow-up extinguish after UGV_GOTO reaches "
+                            f"incident {a.incident_id}."
+                        ),
+                    )
+                )
+    return out
+
+
+def _needs_explicit_extinguish_step(resource: UrbanResource | None) -> bool:
+    return resource is not None and resource.kind in {"unmanned_vehicle", "ground_vehicle"}
+
+
+def _is_mobile_dispatch(action: UrbanAction) -> bool:
+    return action.kind in {"dispatch_vehicle", "dispatch_drone"}
+
+
+def _dedupe_mobile_targets(actions: list[UrbanAction]) -> list[UrbanAction]:
+    out: list[UrbanAction] = []
+    target_role: dict[str, str] = {}
+    for action in actions:
+        if not _is_mobile_dispatch(action):
+            out.append(action)
+            continue
+        role = str(action.parameters.get("role", ""))
+        existing = target_role.get(action.target_id)
+        if existing == "fire_suppression" and role != "fire_suppression":
+            continue
+        if existing is not None and existing != "fire_suppression":
+            if role == "fire_suppression":
+                out = [
+                    a
+                    for a in out
+                    if not (_is_mobile_dispatch(a) and a.target_id == action.target_id)
+                ]
+                target_role[action.target_id] = role
+                out.append(action)
+            continue
+        target_role[action.target_id] = role
+        out.append(action)
     return out
 
 
@@ -320,13 +376,22 @@ def integrate_actions_deterministic(
 ) -> tuple[list[UrbanAction], str]:
     """Merge sub drafts + policy fire_suppression; order by response role."""
     drafts: list[ActionDraft] = []
+    blocked: list[str] = []
     for sp in sub_plans:
         if sp.status == "ok":
             drafts.extend(sp.action_drafts)
+        else:
+            blocked.append(f"{sp.role}:{sp.status}:{sp.rationale}")
     actions = [draft_to_action(d) for d in drafts]
     actions.extend(merge_fire_suppression_from_policy(state, dispatch_policy))
+    actions = _dedupe_mobile_targets(actions)
     actions.sort(key=_action_priority)
-    return actions, "deterministic merge: role priority + policy fire_suppression"
+    rationale = "deterministic merge: role priority + policy fire_suppression"
+    if blocked:
+        rationale += "; blocked=" + " | ".join(blocked)
+    if not actions:
+        rationale += "; no executable actions after hard constraints"
+    return actions, rationale
 
 
 def new_batch_id() -> str:

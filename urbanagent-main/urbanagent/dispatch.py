@@ -5,6 +5,7 @@ import math
 from dataclasses import dataclass
 
 from urbanagent.routing import LocalGraphRoutePlanner, RoutePlanner
+from urbanagent.resource_policy import is_dispatchable_resource, resource_block_reason
 from urbanagent.types import (
     ActionKind,
     CandidateScore,
@@ -31,7 +32,7 @@ class RoleSpec:
 ROLE_SPECS: dict[str, RoleSpec] = {
     "fire_suppression": RoleSpec(
         role="fire_suppression",
-        resource_kinds=("fire_truck",),
+        resource_kinds=("fire_truck", "unmanned_vehicle", "ground_vehicle"),
         required_capability="fire_suppression",
         action_kind="dispatch_vehicle",
     ),
@@ -209,7 +210,7 @@ class DispatchPolicy:
         return ["aerial_recon"]
 
     def _resource_matches(self, resource: UrbanResource, spec: RoleSpec) -> bool:
-        if resource.status != "available":
+        if not is_dispatchable_resource(resource):
             return False
         if resource.kind not in spec.resource_kinds:
             return False
@@ -220,6 +221,8 @@ class DispatchPolicy:
 
     def _load_penalty(self, resource: UrbanResource, role: str) -> float:
         penalty = 0.0
+        if resource_block_reason(resource) is not None:
+            penalty += 1000.0
         if resource.current_task_id:
             penalty += 100.0
         if role == "fire_suppression":
@@ -259,16 +262,20 @@ class DispatchPolicy:
 def assignment_to_action(assignment: DispatchAssignment) -> UrbanAction:
     """Convert a dispatch assignment into a sandbox action."""
 
+    parameters = {
+        "incident_id": assignment.incident_id,
+        "role": assignment.role,
+        "score": round(assignment.score.score, 4),
+        "route_source": assignment.score.route.source,
+    }
+    if assignment.role == "fire_suppression":
+        parameters["intent"] = "extinguish"
+        parameters["capability"] = "fire_suppression"
     return UrbanAction(
         kind=assignment.action_kind,
         target_id=assignment.resource_id,
         destination=assignment.destination,
-        parameters={
-            "incident_id": assignment.incident_id,
-            "role": assignment.role,
-            "score": round(assignment.score.score, 4),
-            "route_source": assignment.score.route.source,
-        },
+        parameters=parameters,
         reason=assignment.reason,
     )
 

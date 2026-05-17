@@ -14,7 +14,7 @@ from urbanagent.tooling.mcp_stdio import McpStdioToolBackend
 
 
 class ExternalToolFacade:
-    """Async context manager: connects all backends for the duration of `UrbanAgent.run`."""
+    """Async context manager that connects external tool backends for one run."""
 
     def __init__(self, backends: Sequence[Any]) -> None:
         self._backends = [b for b in backends if b is not None]

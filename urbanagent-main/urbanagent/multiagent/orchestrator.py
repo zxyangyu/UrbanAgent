@@ -347,8 +347,17 @@ async def build_committed_batch(
             actions = await llm_rerank_actions(actions, task, llm)
         except Exception:
             pass
-    if incident_id:
-        _append_mark_incident(actions, incident_id)
+    before_supported_filter = len(actions)
+    actions = [
+        action
+        for action in actions
+        if action.kind in {"dispatch_vehicle", "dispatch_drone"}
+    ]
+    if len(actions) != before_supported_filter:
+        rationale = f"{rationale}; filtered unsupported CarlaBridge v1.0 actions"
+    if not any(a.kind in {"dispatch_vehicle", "dispatch_drone"} for a in actions):
+        rationale = f"{rationale}; no dispatchable mobile resources"
+        actions = []
     return CommittedBatch(batch_id=new_batch_id(), actions=actions, rationale=rationale)
 
 

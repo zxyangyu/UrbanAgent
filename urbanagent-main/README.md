@@ -203,7 +203,6 @@ CarlaBridgeSandboxClient(
 
 MCP / HTTP API 是论文中的外部工具库 **T**，与 CarlaBridge 环境 **W** 分离。
 
-- 单智能体 `UrbanAgent` 仍支持 `build_external_tool_facade(http_tools_path=..., mcp_servers_path=...)`
 - 多智能体 MVP 目前尚未把 MCP / HTTP 接入子 Agent 工具层，后续应作为 `SubAgentToolkit` 或元智能体工具扩展
 
 ## 包结构

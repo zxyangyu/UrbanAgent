@@ -26,6 +26,7 @@ import uuid
 from typing import Any
 
 from urbanagent.errors import SandboxWireError
+from urbanagent.resource_policy import bridge_status_from_role_speed
 from urbanagent.sandbox import SandboxClient
 from urbanagent.types import (
     ActionResult,
@@ -40,6 +41,8 @@ from urbanagent.types import (
 
 PROTOCOL_VERSION = "1.0"
 EXTINGUISH_RADIUS_M = 5.0
+DEFAULT_UAV_CRUISE_SPEED = 8.0
+DEFAULT_UGV_TARGET_SPEED = 25.0
 _LOG = logging.getLogger(__name__)
 
 
@@ -180,6 +183,16 @@ class CarlaBridgeSandboxClient(SandboxClient):
             await self._emit_event_log(severity="warn", message=message)
             return ActionResult(status="rejected", action=action, message=message)
 
+        conflict = self._in_flight_conflict(cmd_payload["target"])
+        if conflict is not None:
+            message = (
+                f"target_in_flight: {cmd_payload['target']!r} already has command "
+                f"{conflict.get('cmd_id') or conflict.get('id') or '<unknown>'}"
+            )
+            _LOG.warning(message)
+            await self._emit_event_log(severity="warn", message=message)
+            return ActionResult(status="rejected", action=action, message=message)
+
         cmd_id = cmd_payload["id"]
         loop = asyncio.get_running_loop()
         fut: asyncio.Future[ActionResult] = loop.create_future()
@@ -237,6 +250,17 @@ class CarlaBridgeSandboxClient(SandboxClient):
     ) -> None:
         await self.connect()
         await self._emit_event_log(severity=severity, message=message, cmd_id=cmd_id)
+
+    def _in_flight_conflict(self, target_id: str) -> dict[str, Any] | None:
+        terminal = {"completed", "failed", "cancelled"}
+        for item in self._latest_in_flight:
+            target = str(item.get("target", "") or "")
+            if target != target_id:
+                continue
+            status = str(item.get("status", "") or "").lower()
+            if status not in terminal:
+                return item
+        return None
 
     def _register_handlers(self) -> None:
         assert self._sio is not None
@@ -385,6 +409,11 @@ class CarlaBridgeSandboxClient(SandboxClient):
             _LOG.warning("unknown command_status %r for cmd_id=%s", status, cmd_id)
             return
 
+        self._latest_in_flight = [
+            item
+            for item in self._latest_in_flight
+            if str(item.get("cmd_id") or item.get("id") or "") != cmd_id
+        ]
         fut.set_result(result)
 
     def _handle_scenario_event(self, data: Any) -> None:
@@ -454,9 +483,12 @@ class CarlaBridgeSandboxClient(SandboxClient):
         if action.kind == "dispatch_drone":
             if action.destination is None:
                 return None
-            params: dict[str, Any] = {"waypoint": _coord_data(action.destination)}
-            if "cruise_speed" in action.parameters:
-                params["cruise_speed"] = float(action.parameters["cruise_speed"])
+            params: dict[str, Any] = {
+                "waypoint": _coord_data(action.destination),
+                "cruise_speed": float(
+                    action.parameters.get("cruise_speed", DEFAULT_UAV_CRUISE_SPEED)
+                ),
+            }
             return {
                 "id": cmd_id,
                 "kind": "UAV_GOTO",
@@ -477,9 +509,12 @@ class CarlaBridgeSandboxClient(SandboxClient):
                     "priority": priority,
                     "params": {"incident_id": incident_id},
                 }
-            params = {"dest": _coord_data(action.destination)}
-            if "target_speed" in action.parameters:
-                params["target_speed"] = float(action.parameters["target_speed"])
+            params = {
+                "dest": _coord_data(action.destination),
+                "target_speed": float(
+                    action.parameters.get("target_speed", DEFAULT_UGV_TARGET_SPEED)
+                ),
+            }
             return {
                 "id": cmd_id,
                 "kind": "UGV_GOTO",
@@ -493,6 +528,9 @@ class CarlaBridgeSandboxClient(SandboxClient):
     def _match_fire_incident(self, action: UrbanAction) -> str | None:
         intent = str(action.parameters.get("intent", "") or "").lower()
         capability = str(action.parameters.get("capability", "") or "").lower()
+        incident_id = str(action.parameters.get("incident_id", "") or "").strip()
+        if action.parameters.get("force_extinguish") and incident_id:
+            return incident_id
         reason = (action.reason or "").lower()
         wants_extinguish = (
             intent == "extinguish"
@@ -571,7 +609,7 @@ def _vehicle_resource(raw: dict[str, Any]) -> UrbanResource:
         kind = "ground_vehicle"
         caps = ["ground_mobility"]
     speed = _maybe_float(raw.get("speed")) or 0.0
-    status = "dispatched" if speed > 0.1 else "available"
+    status = bridge_status_from_role_speed(role, speed)
     return UrbanResource(
         id=rid,
         kind=kind,  # type: ignore[arg-type]
@@ -588,10 +626,7 @@ def _uav_resource(raw: dict[str, Any]) -> UrbanResource:
     rid = str(raw.get("id", ""))
     role = str(raw.get("role", "")).lower()
     speed = _maybe_float(raw.get("speed")) or 0.0
-    if role == "patrol":
-        status = "available"
-    else:
-        status = "dispatched" if speed > 0.1 else "available"
+    status = bridge_status_from_role_speed(role, speed, patrol_available=True)
     return UrbanResource(
         id=rid,
         kind="drone",

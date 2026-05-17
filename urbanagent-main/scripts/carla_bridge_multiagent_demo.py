@@ -58,7 +58,7 @@ async def main() -> int:
         kind="fire",
         severity="high",
         position=Coordinate(args.incident_x, args.incident_y, args.incident_z),
-        description="Fallback incident supplied by UrbanAgent demo arguments.",
+        description="Fallback incident supplied by multi-agent demo arguments.",
     )
     sandbox = CarlaBridgeSandboxClient(
         args.url,

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from urbanagent.resource_policy import is_dispatchable_resource
 from urbanagent.routing import LocalGraphRoutePlanner
 from urbanagent.types import CityState, Coordinate, Incident, ResourceKind, RouteEstimate, TrafficSignal, UrbanResource
 
@@ -38,7 +39,7 @@ class SubAgentToolkit:
     ) -> UrbanResource | None:
         caps = capabilities or []
         for r in state.resources:
-            if r.status != "available":
+            if not is_dispatchable_resource(r):
                 continue
             if allowed_ids is not None and r.id not in allowed_ids:
                 continue

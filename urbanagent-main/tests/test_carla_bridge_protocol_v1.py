@@ -144,6 +144,13 @@ class SnapshotTranslationTest(unittest.TestCase):
                         "speed": 2.0,
                         "battery": 88,
                     },
+                    {
+                        "id": "UGV-02",
+                        "role": "mission",
+                        "pose": [11, 21, 0],
+                        "speed": 0.0,
+                        "battery": 80,
+                    },
                     {"id": "VEH-99", "role": "civilian", "pose": [9, 9, 0]},
                 ],
                 "uavs": [
@@ -151,6 +158,13 @@ class SnapshotTranslationTest(unittest.TestCase):
                         "id": "UAV-01",
                         "role": "patrol",
                         "pose": [5, 6, 30],
+                        "speed": 3.0,
+                        "battery": 70,
+                    },
+                    {
+                        "id": "UAV-02",
+                        "role": "tasked",
+                        "pose": [6, 7, 30],
                         "speed": 0.0,
                         "battery": 70,
                     }
@@ -166,10 +180,13 @@ class SnapshotTranslationTest(unittest.TestCase):
             }
         )
 
-        # civilian vehicle filtered out; UGV becomes unmanned_vehicle
+        # civilian vehicle filtered out; dispatchable UGV becomes unmanned_vehicle
         kinds = [r.kind for r in state.resources]
-        self.assertEqual(kinds, ["unmanned_vehicle", "drone"])
+        self.assertEqual(kinds, ["unmanned_vehicle", "ground_vehicle", "drone", "drone"])
         self.assertEqual(state.resources[0].position, Coordinate(10.0, 20.0, 0.0))
+        self.assertEqual(state.resources[1].status, "busy")
+        self.assertEqual(state.resources[2].status, "available")
+        self.assertEqual(state.resources[3].status, "busy")
         self.assertEqual(state.traffic_signals[0].mode, "green")
         self.assertEqual(state.traffic_signals[0].position, Coordinate(1.0, 2.0, 3.0))
         self.assertEqual(state.incidents[0].position, Coordinate(90.0, 0.0, 0.0))
@@ -273,6 +290,43 @@ class SendActionTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.status, "applied")
         self.assertIn("completed", result.message)
 
+    async def test_dispatch_drone_adds_default_cruise_speed(self) -> None:
+        client = CarlaBridgeSandboxClient("http://test")
+        fake = FakeAsyncClient()
+        await _connect_with_fake(client, fake)
+
+        fake.call_responder = lambda event, payload: (
+            {"status": "accepted", "cmd_id": payload["payload"]["id"], "queued_at_sim_time": 0.0}
+            if event == "agent.command" else None
+        )
+
+        action = UrbanAction(
+            kind="dispatch_drone",
+            target_id="UAV-01",
+            destination=Coordinate(10, 20, 85),
+        )
+
+        async def push_completed_after_ack() -> None:
+            await asyncio.sleep(0)
+            inner = fake.calls[-1][1]["payload"]
+            self.assertEqual(inner["kind"], "UAV_GOTO")
+            self.assertEqual(inner["params"]["cruise_speed"], 8.0)
+            await fake.deliver(
+                "command_status",
+                _envelope(
+                    "command_status",
+                    {
+                        "cmd_id": inner["id"],
+                        "status": "completed",
+                        "kind": "UAV_GOTO",
+                        "target": "UAV-01",
+                    },
+                ),
+            )
+
+        result, _ = await asyncio.gather(client.send_action(action), push_completed_after_ack())
+        self.assertEqual(result.status, "applied")
+
     async def test_dispatch_vehicle_upgrades_to_extinguish(self) -> None:
         client = CarlaBridgeSandboxClient("http://test")
         fake = FakeAsyncClient()
@@ -338,6 +392,66 @@ class SendActionTest(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0)
             event, payload = fake.calls[-1]
             inner = payload["payload"]
+            self.assertEqual(inner["kind"], "UGV_EXTINGUISH")
+            self.assertEqual(inner["params"], {"incident_id": "fire-001"})
+            await fake.deliver(
+                "command_status",
+                _envelope(
+                    "command_status",
+                    {
+                        "cmd_id": inner["id"],
+                        "status": "completed",
+                        "kind": "UGV_EXTINGUISH",
+                        "target": "UGV-01",
+                    },
+                ),
+            )
+
+        result, _ = await asyncio.gather(client.send_action(action), push_terminal())
+        self.assertEqual(result.status, "applied")
+
+    async def test_force_extinguish_uses_incident_id_without_local_range_check(self) -> None:
+        client = CarlaBridgeSandboxClient("http://test")
+        fake = FakeAsyncClient()
+        await _connect_with_fake(client, fake)
+
+        await fake.deliver(
+            "state_snapshot",
+            _envelope(
+                "state_snapshot",
+                {
+                    "vehicles": [
+                        {"id": "UGV-01", "role": "dispatchable", "pose": [0, 0, 0]}
+                    ],
+                    "uavs": [],
+                    "incidents": [
+                        {
+                            "id": "fire-001",
+                            "kind": "fire",
+                            "position": {"x": 100.0, "y": 0.0, "z": 0.0},
+                        }
+                    ],
+                },
+            ),
+        )
+        fake.call_responder = lambda event, payload: (
+            {"status": "accepted", "cmd_id": payload["payload"]["id"], "queued_at_sim_time": 0.0}
+            if event == "agent.command" else None
+        )
+        action = UrbanAction(
+            kind="dispatch_vehicle",
+            target_id="UGV-01",
+            destination=Coordinate(100, 0, 0),
+            parameters={
+                "incident_id": "fire-001",
+                "intent": "extinguish",
+                "force_extinguish": True,
+            },
+        )
+
+        async def push_terminal() -> None:
+            await asyncio.sleep(0)
+            inner = fake.calls[-1][1]["payload"]
             self.assertEqual(inner["kind"], "UGV_EXTINGUISH")
             self.assertEqual(inner["params"], {"incident_id": "fire-001"})
             await fake.deliver(
@@ -558,6 +672,37 @@ class SendActionTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("unknown_target", result.message)
         self.assertEqual([e for e, _ in fake.calls if e == "agent.command"], [])
 
+    async def test_in_flight_target_rejected_before_rpc(self) -> None:
+        client = CarlaBridgeSandboxClient("http://test")
+        fake = FakeAsyncClient()
+        await _connect_with_fake(client, fake)
+
+        await fake.deliver(
+            "state_snapshot",
+            _envelope(
+                "state_snapshot",
+                {
+                    "vehicles": [
+                        {"id": "UGV-01", "role": "dispatchable", "pose": [0, 0, 0]}
+                    ],
+                    "uavs": [],
+                    "in_flight_commands": [
+                        {"cmd_id": "cmd-existing", "target": "UGV-01", "status": "ongoing"}
+                    ],
+                },
+            ),
+        )
+
+        action = UrbanAction(
+            kind="dispatch_vehicle",
+            target_id="UGV-01",
+            destination=Coordinate(1, 1, 0),
+        )
+        result = await client.send_action(action)
+        self.assertEqual(result.status, "rejected")
+        self.assertIn("target_in_flight", result.message)
+        self.assertEqual([e for e, _ in fake.calls if e == "agent.command"], [])
+
     async def test_extinguish_uses_ugv_position_not_destination(self) -> None:
         """UGV far from fire should fall back to UGV_GOTO even with extinguish intent."""
 
@@ -603,6 +748,7 @@ class SendActionTest(unittest.IsolatedAsyncioTestCase):
             inner = fake.calls[-1][1]["payload"]
             # UGV is 100m from the fire, not within 5m, so adapter must NOT upgrade.
             self.assertEqual(inner["kind"], "UGV_GOTO")
+            self.assertEqual(inner["params"]["target_speed"], 25.0)
             await fake.deliver(
                 "command_status",
                 _envelope(
