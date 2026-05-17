@@ -1,15 +1,28 @@
-"""Socket.IO adapter for CarlaBridge Urban Agent protocol v1.1.
+"""Socket.IO adapter for CarlaBridge — Bridge × Agent Protocol v1.0.
 
-This client connects UrbanAgent to the middleware, not directly to CARLA.
-It implements :class:`urbanagent.sandbox.SandboxClient` so existing single-agent
-and multi-agent pipelines can use it as their sandbox adapter.
+Connects UrbanAgent (decision layer) to CarlaBridge (CARLA middleware) on the
+``/agent`` Socket.IO namespace. Implements protocol v1.0 (see
+``bridge-agent-protocol-v1.md``):
+
+* handshake via ``hello`` RPC with version negotiation
+* inbound: ``state_snapshot`` / ``command_status`` / ``scenario_event`` /
+  ``event_log``
+* outbound: ``agent.command`` RPC (8 command kinds: UAV_PATROL / UAV_GOTO /
+  UAV_RTL / UAV_HOLD / UGV_GOTO / UGV_RTL / UGV_EXTINGUISH / UGV_STOP) plus
+  optional ``event_log``
+
+The class implements :class:`urbanagent.sandbox.SandboxClient` so existing
+single-agent and multi-agent pipelines reuse it unchanged. ``send_action``
+blocks until a terminal ``command_status`` (or ``ongoing``) arrives so callers
+see Bridge-side completion, not just RPC acceptance.
 """
 from __future__ import annotations
 
 import asyncio
+import logging
+import math
 import time
 import uuid
-from collections.abc import Mapping
 from typing import Any
 
 from urbanagent.errors import SandboxWireError
@@ -25,20 +38,13 @@ from urbanagent.types import (
 )
 
 
-DEFAULT_ACTION_MAP = {
-    "dispatch_drone": "UAV_DISPATCH",
-    "control_traffic_light": "TL_SET_STATE",
-    "mark_incident": "MARK_EVENT",
-}
+PROTOCOL_VERSION = "1.0"
+EXTINGUISH_RADIUS_M = 5.0
+_LOG = logging.getLogger(__name__)
 
 
 class CarlaBridgeSandboxClient(SandboxClient):
-    """CarlaBridge Socket.IO v4 `/agent` client.
-
-    The bridge pushes `state.snapshot`; `get_state()` returns the latest cached
-    snapshot. `send_action()` emits `agent_command` and waits for `agent_ack` or
-    `agent_reject`; physical completion is confirmed later by polling snapshots.
-    """
+    """CarlaBridge Socket.IO v4 ``/agent`` client (protocol v1.0)."""
 
     def __init__(
         self,
@@ -46,50 +52,63 @@ class CarlaBridgeSandboxClient(SandboxClient):
         *,
         namespace: str = "/agent",
         agent_id: str = "urban_agent_v1",
-        capabilities: list[str] | None = None,
-        action_map: Mapping[str, str] | None = None,
         connect_timeout: float = 30.0,
-        ack_timeout: float = 10.0,
+        ack_timeout: float = 2.0,
         state_timeout: float = 30.0,
-        heartbeat_interval: float = 1.0,
+        command_timeout: float = 60.0,
+        extinguish_radius_m: float = EXTINGUISH_RADIUS_M,
         default_incidents: list[Incident] | None = None,
     ) -> None:
         self.url = url
         self.namespace = namespace
         self.agent_id = agent_id
-        self.capabilities = capabilities or [
-            "ugv_control",
-            "uav_control",
-            "traffic_light_control",
-        ]
-        self.action_map = dict(DEFAULT_ACTION_MAP)
-        if action_map:
-            self.action_map.update(action_map)
         self.connect_timeout = connect_timeout
         self.ack_timeout = ack_timeout
         self.state_timeout = state_timeout
-        self.heartbeat_interval = heartbeat_interval
+        self.command_timeout = command_timeout
+        self.extinguish_radius_m = float(extinguish_radius_m)
         self.default_incidents = list(default_incidents or [])
 
         self._sio: Any | None = None
-        self._heartbeat_task: asyncio.Task[None] | None = None
         self._connected = asyncio.Event()
         self._state_event = asyncio.Event()
         self._latest_state: CityState | None = None
-        self._last_frame: int | None = None
-        self._last_sim_time: float | None = None
-        self._pending: dict[str, asyncio.Future[ActionResult]] = {}
-        self._pending_actions: dict[str, UrbanAction] = {}
+        self._latest_frame: int | None = None
+        self._latest_sim_time: float | None = None
+        self._latest_in_flight: list[dict[str, Any]] = []
+        self._known_entity_ids: set[str] = set()
+
+        self._bridge_session_id: str | None = None
+        self._run_id: int | None = None
+        self._scenario: str | None = None
+
+        self._in_flight_futures: dict[str, asyncio.Future[ActionResult]] = {}
+        self._in_flight_actions: dict[str, UrbanAction] = {}
         self._events: list[dict[str, Any]] = []
-        self._suggestions: list[dict[str, Any]] = []
 
     @property
     def event_logs(self) -> list[dict[str, Any]]:
         return list(self._events)
 
     @property
-    def suggestions(self) -> list[dict[str, Any]]:
-        return list(self._suggestions)
+    def in_flight_commands_view(self) -> list[dict[str, Any]]:
+        """Latest ``state_snapshot.in_flight_commands`` for debugging."""
+
+        return list(self._latest_in_flight)
+
+    @property
+    def known_entity_ids(self) -> set[str]:
+        """Entity IDs (UGV-* / UAV-*) seen in the most recent ``state_snapshot``."""
+
+        return set(self._known_entity_ids)
+
+    @property
+    def bridge_session_id(self) -> str | None:
+        return self._bridge_session_id
+
+    @property
+    def run_id(self) -> int | None:
+        return self._run_id
 
     async def connect(self) -> None:
         if self._sio is not None and self._sio.connected:
@@ -98,7 +117,7 @@ class CarlaBridgeSandboxClient(SandboxClient):
             import socketio
         except ImportError as exc:  # pragma: no cover - depends on environment
             raise RuntimeError(
-                "CarlaBridgeSandboxClient requires python-socketio[client]. "
+                "CarlaBridgeSandboxClient requires python-socketio[asyncio_client]. "
                 "Run `pip install -e .` after updating dependencies.",
             ) from exc
 
@@ -111,31 +130,13 @@ class CarlaBridgeSandboxClient(SandboxClient):
             wait_timeout=self.connect_timeout,
         )
         await asyncio.wait_for(self._connected.wait(), timeout=self.connect_timeout)
-        await self._emit_envelope(
-            "hello",
-            {
-                "agent_id": self.agent_id,
-                "capabilities": list(self.capabilities),
-            },
-        )
-        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+        await self._do_hello()
 
     async def close(self) -> None:
-        if self._heartbeat_task is not None:
-            self._heartbeat_task.cancel()
-            try:
-                await self._heartbeat_task
-            except asyncio.CancelledError:
-                pass
-            self._heartbeat_task = None
         if self._sio is not None and self._sio.connected:
             await self._sio.disconnect()
         self._sio = None
-        for fut in self._pending.values():
-            if not fut.done():
-                fut.set_exception(SandboxWireError("CarlaBridge connection closed"))
-        self._pending.clear()
-        self._pending_actions.clear()
+        self._fail_pending("CarlaBridge connection closed")
 
     async def __aenter__(self) -> CarlaBridgeSandboxClient:
         await self.connect()
@@ -155,27 +156,87 @@ class CarlaBridgeSandboxClient(SandboxClient):
 
     async def send_action(self, action: UrbanAction) -> ActionResult:
         await self.connect()
-        msg_id = str(uuid.uuid4())
+
+        if action.kind in ("control_traffic_light", "mark_incident"):
+            message = f"protocol v1.0 does not support {action.kind}"
+            _LOG.warning(message)
+            await self._emit_event_log(severity="warn", message=message)
+            return ActionResult(status="rejected", action=action, message=message)
+
+        cmd_payload = self._action_to_agent_command(action)
+        if cmd_payload is None:
+            return ActionResult(
+                status="rejected",
+                action=action,
+                message=f"action {action.kind} could not be mapped to protocol v1.0 command",
+            )
+
+        if self._known_entity_ids and cmd_payload["target"] not in self._known_entity_ids:
+            message = (
+                f"unknown_target: {cmd_payload['target']!r} not in latest Bridge fleet "
+                f"{sorted(self._known_entity_ids)}"
+            )
+            _LOG.warning(message)
+            await self._emit_event_log(severity="warn", message=message)
+            return ActionResult(status="rejected", action=action, message=message)
+
+        cmd_id = cmd_payload["id"]
         loop = asyncio.get_running_loop()
         fut: asyncio.Future[ActionResult] = loop.create_future()
-        self._pending[msg_id] = fut
-        self._pending_actions[msg_id] = action
-        payload = self._action_to_agent_command(action)
-        try:
-            await self._emit_envelope("agent_command", payload, msg_id=msg_id)
-            return await asyncio.wait_for(fut, timeout=self.ack_timeout)
-        except asyncio.TimeoutError as exc:
-            raise SandboxWireError(
-                f"CarlaBridge did not ack command within {self.ack_timeout}s "
-                f"(cmd_id={msg_id})",
-            ) from exc
-        finally:
-            self._pending.pop(msg_id, None)
-            self._pending_actions.pop(msg_id, None)
+        self._in_flight_futures[cmd_id] = fut
+        self._in_flight_actions[cmd_id] = action
 
-    async def send_event_log(self, message: str, *, severity: str = "info") -> None:
+        envelope = self._wrap("agent.command", cmd_payload)
+        try:
+            try:
+                ack = await self._sio.call(
+                    "agent.command",
+                    envelope,
+                    namespace=self.namespace,
+                    timeout=self.ack_timeout,
+                )
+            except asyncio.TimeoutError as exc:
+                raise SandboxWireError(
+                    f"agent.command RPC timeout (cmd_id={cmd_id})",
+                ) from exc
+
+            if not isinstance(ack, dict) or ack.get("status") != "accepted":
+                reason = (
+                    str(ack.get("reason", "rejected"))
+                    if isinstance(ack, dict) else "rejected"
+                )
+                detail = ack.get("detail") if isinstance(ack, dict) else None
+                message = f"rejected: {reason}"
+                if detail:
+                    message = f"{message} {detail}"
+                return ActionResult(status="rejected", action=action, message=message)
+
+            try:
+                return await asyncio.wait_for(fut, timeout=self.command_timeout)
+            except asyncio.TimeoutError:
+                message = (
+                    f"command_status timeout after {self.command_timeout:.1f}s "
+                    f"(cmd_id={cmd_id}, kind={cmd_payload['kind']}, "
+                    f"target={cmd_payload['target']})"
+                )
+                _LOG.warning(message)
+                await self._emit_event_log(
+                    severity="warn", message=message, cmd_id=cmd_id
+                )
+                return ActionResult(status="rejected", action=action, message=message)
+        finally:
+            self._in_flight_futures.pop(cmd_id, None)
+            self._in_flight_actions.pop(cmd_id, None)
+
+    async def send_event_log(
+        self,
+        message: str,
+        *,
+        severity: str = "info",
+        cmd_id: str | None = None,
+    ) -> None:
         await self.connect()
-        await self._emit_envelope("event_log", {"severity": severity, "message": message})
+        await self._emit_event_log(severity=severity, message=message, cmd_id=cmd_id)
 
     def _register_handlers(self) -> None:
         assert self._sio is not None
@@ -188,119 +249,278 @@ class CarlaBridgeSandboxClient(SandboxClient):
         async def disconnect() -> None:  # type: ignore[no-redef]
             self._connected.clear()
 
-        @self._sio.on("state.snapshot", namespace=self.namespace)
-        async def state_snapshot(data: Any) -> None:
-            env = _as_envelope("state.snapshot", data)
-            self._last_frame = _maybe_int(env.get("frame"))
-            self._last_sim_time = _maybe_float(env.get("sim_time"))
-            self._latest_state = carla_snapshot_to_city_state(
-                dict(env.get("payload") or {}),
-                timestamp=str(env.get("timestamp", time.time())),
-                default_incidents=self.default_incidents,
-            )
-            self._state_event.set()
+        @self._sio.on("state_snapshot", namespace=self.namespace)
+        async def on_state_snapshot(data: Any) -> None:
+            self._handle_state_snapshot(data)
 
-        @self._sio.on("suggestion", namespace=self.namespace)
-        async def suggestion(data: Any) -> None:
-            env = _as_envelope("suggestion", data)
-            self._suggestions.append(dict(env.get("payload") or {}))
+        @self._sio.on("command_status", namespace=self.namespace)
+        async def on_command_status(data: Any) -> None:
+            self._handle_command_status(data)
 
-        @self._sio.on("agent_ack", namespace=self.namespace)
-        async def agent_ack(data: Any) -> None:
-            env = _as_envelope("agent_ack", data)
-            payload = dict(env.get("payload") or {})
-            cmd_id = str(payload.get("cmd_id", ""))
-            fut = self._pending.get(cmd_id)
-            if fut is not None and not fut.done():
-                fut.set_result(
-                    ActionResult(
-                        status="accepted",
-                        action=self._pending_actions.get(cmd_id, _pending_action(payload)),
-                        message=str(payload.get("comment", "queued")),
-                    )
-                )
-
-        @self._sio.on("agent_reject", namespace=self.namespace)
-        async def agent_reject(data: Any) -> None:
-            env = _as_envelope("agent_reject", data)
-            payload = dict(env.get("payload") or {})
-            cmd_id = str(payload.get("cmd_id", ""))
-            err = payload.get("error") if isinstance(payload.get("error"), dict) else {}
-            fut = self._pending.get(cmd_id)
-            if fut is not None and not fut.done():
-                fut.set_result(
-                    ActionResult(
-                        status="rejected",
-                        action=self._pending_actions.get(cmd_id, _pending_action(payload)),
-                        message=str(err.get("message") or payload.get("status") or "rejected"),
-                    )
-                )
+        @self._sio.on("scenario_event", namespace=self.namespace)
+        async def on_scenario_event(data: Any) -> None:
+            self._handle_scenario_event(data)
 
         @self._sio.on("event_log", namespace=self.namespace)
-        async def event_log(data: Any) -> None:
-            env = _as_envelope("event_log", data)
-            self._events.append(dict(env.get("payload") or {}))
+        async def on_event_log(data: Any) -> None:
+            payload = _unwrap_payload(data)
+            self._events.append(payload)
 
-        @self._sio.on("pong", namespace=self.namespace)
-        async def pong(data: Any) -> None:
-            return None
+    async def _do_hello(self) -> None:
+        assert self._sio is not None
+        try:
+            resp = await self._sio.call(
+                "hello",
+                {"agent_id": self.agent_id, "version": PROTOCOL_VERSION},
+                namespace=self.namespace,
+                timeout=2.0,
+            )
+        except asyncio.TimeoutError as exc:
+            raise SandboxWireError("hello RPC timed out") from exc
+        if not isinstance(resp, dict):
+            raise SandboxWireError(f"unexpected hello response: {resp!r}")
+        self._bridge_session_id = str(resp.get("bridge_session_id", "") or "") or None
+        self._scenario = str(resp.get("scenario", "") or "") or None
+        server_version = str(resp.get("version", "") or "")
+        if server_version and _major(server_version) != _major(PROTOCOL_VERSION):
+            _LOG.warning(
+                "protocol major version mismatch: bridge=%s agent=%s",
+                server_version,
+                PROTOCOL_VERSION,
+            )
 
-    async def _heartbeat_loop(self) -> None:
-        while True:
-            await asyncio.sleep(self.heartbeat_interval)
-            if self._sio is not None and self._sio.connected:
-                await self._emit_envelope("ping", {})
+    def _handle_state_snapshot(self, data: Any) -> None:
+        env = _as_envelope(data)
+        payload = env.get("payload") or {}
+        self._latest_frame = _maybe_int(env.get("frame"))
+        self._latest_sim_time = _maybe_float(env.get("sim_time"))
 
-    async def _emit_envelope(
-        self,
-        event_type: str,
-        payload: dict[str, Any],
-        *,
-        msg_id: str | None = None,
-    ) -> str:
-        if self._sio is None:
-            raise SandboxWireError("CarlaBridge Socket.IO client is not connected")
-        mid = msg_id or str(uuid.uuid4())
-        env = {
-            "version": "1.0",
-            "msg_id": mid,
+        observed_session = str(payload.get("bridge_session_id", "") or "") or None
+        observed_run = _maybe_int(payload.get("run_id"))
+
+        if (
+            observed_session
+            and self._bridge_session_id
+            and observed_session != self._bridge_session_id
+        ):
+            _LOG.warning(
+                "bridge_session_id changed (%s -> %s); cancelling in-flight commands",
+                self._bridge_session_id,
+                observed_session,
+            )
+            self._fail_pending("bridge_restart")
+            self._bridge_session_id = observed_session
+
+        if (
+            observed_run is not None
+            and self._run_id is not None
+            and observed_run != self._run_id
+        ):
+            _LOG.info(
+                "run_id changed (%s -> %s) via state_snapshot; treating as reset",
+                self._run_id,
+                observed_run,
+            )
+            self._fail_pending("scenario_reset")
+
+        if observed_session:
+            self._bridge_session_id = observed_session
+        if observed_run is not None:
+            self._run_id = observed_run
+
+        self._latest_in_flight = [
+            dict(item) for item in (payload.get("in_flight_commands") or [])
+            if isinstance(item, dict)
+        ]
+
+        ids: set[str] = set()
+        for raw in payload.get("vehicles") or []:
+            if isinstance(raw, dict) and raw.get("id"):
+                ids.add(str(raw["id"]))
+        for raw in payload.get("uavs") or []:
+            if isinstance(raw, dict) and raw.get("id"):
+                ids.add(str(raw["id"]))
+        self._known_entity_ids = ids
+
+        self._latest_state = carla_snapshot_to_city_state(
+            dict(payload),
+            timestamp=str(env.get("timestamp", time.time())),
+            default_incidents=self.default_incidents,
+        )
+        self._state_event.set()
+
+    def _handle_command_status(self, data: Any) -> None:
+        env = _as_envelope(data)
+        payload = env.get("payload") or {}
+        cmd_id = str(payload.get("cmd_id", "") or "")
+        if not cmd_id:
+            return
+        fut = self._in_flight_futures.get(cmd_id)
+        if fut is None or fut.done():
+            return
+        action = self._in_flight_actions.get(cmd_id) or _placeholder_action(payload)
+        status = str(payload.get("status", "") or "").lower()
+        reason = payload.get("reason")
+        detail = payload.get("detail")
+
+        if status == "completed":
+            result = ActionResult(status="applied", action=action, message="completed")
+        elif status == "ongoing":
+            result = ActionResult(status="applied", action=action, message="ongoing")
+        elif status == "failed":
+            message = f"failed: {reason or 'internal_error'}"
+            if detail:
+                message = f"{message} {detail}"
+            result = ActionResult(status="rejected", action=action, message=message)
+        elif status == "cancelled":
+            message = f"cancelled: {reason or 'unknown'}"
+            if detail:
+                message = f"{message} {detail}"
+            result = ActionResult(status="rejected", action=action, message=message)
+        elif status == "accepted":
+            # accepted is an intermediate state on the RPC ack path; some
+            # bridges may also emit it as an event. Ignore so we keep waiting.
+            return
+        else:
+            _LOG.warning("unknown command_status %r for cmd_id=%s", status, cmd_id)
+            return
+
+        fut.set_result(result)
+
+    def _handle_scenario_event(self, data: Any) -> None:
+        env = _as_envelope(data)
+        payload = env.get("payload") or {}
+        event = str(payload.get("event", "") or "")
+        run_id = _maybe_int(payload.get("run_id"))
+        if event == "reset":
+            _LOG.info("scenario_event:reset received (run_id=%s)", run_id)
+            self._fail_pending("scenario_reset")
+            if run_id is not None:
+                self._run_id = run_id
+        else:
+            _LOG.debug("scenario_event %r ignored (not in v1.0)", event)
+
+    def _fail_pending(self, message: str) -> None:
+        if not self._in_flight_futures:
+            return
+        for cmd_id, fut in list(self._in_flight_futures.items()):
+            if fut.done():
+                continue
+            action = self._in_flight_actions.get(cmd_id) or _placeholder_action(
+                {"cmd_id": cmd_id}
+            )
+            fut.set_result(
+                ActionResult(status="rejected", action=action, message=message)
+            )
+        self._in_flight_futures.clear()
+        self._in_flight_actions.clear()
+
+    def _wrap(self, event_type: str, payload: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "version": PROTOCOL_VERSION,
+            "msg_id": str(uuid.uuid4()),
             "type": event_type,
             "timestamp": time.time(),
-            "frame": self._last_frame,
-            "sim_time": self._last_sim_time,
+            "frame": self._latest_frame,
+            "sim_time": self._latest_sim_time,
             "sender": "agent",
             "payload": payload,
         }
-        await self._sio.emit(event_type, env, namespace=self.namespace)
-        return mid
 
-    def _action_to_agent_command(self, action: UrbanAction) -> dict[str, Any]:
-        bridge_action = self._bridge_action_name(action)
-        params: dict[str, Any] = dict(action.parameters)
-        if action.destination is not None:
-            params.setdefault("position", _coord_data(action.destination))
-        if action.kind == "control_traffic_light":
-            mode = str(params.get("mode", "emergency_preemption"))
-            params["state"] = "green" if mode == "emergency_preemption" else mode
-        if action.kind == "mark_incident":
-            params.setdefault("status", str(action.parameters.get("status", "responding")))
-        return {
-            "target": "" if action.kind == "mark_incident" else action.target_id,
-            "action": bridge_action,
-            "priority": str(action.parameters.get("priority", "normal")),
-            "related_suggestion": action.parameters.get("related_suggestion"),
-            "params": params,
+    async def _emit_event_log(
+        self,
+        *,
+        severity: str,
+        message: str,
+        cmd_id: str | None = None,
+    ) -> None:
+        if self._sio is None or not self._sio.connected:
+            return
+        payload: dict[str, Any] = {
+            "severity": severity,
+            "source": "AGENT",
+            "message": message,
         }
+        if cmd_id:
+            payload["cmd_id"] = cmd_id
+        await self._sio.emit(
+            "event_log", self._wrap("event_log", payload), namespace=self.namespace
+        )
 
-    def _bridge_action_name(self, action: UrbanAction) -> str:
+    def _action_to_agent_command(self, action: UrbanAction) -> dict[str, Any] | None:
+        cmd_id = f"urbanagent-{uuid.uuid4().hex[:12]}"
+        priority = str(action.parameters.get("priority", "normal"))
+
+        if action.kind == "dispatch_drone":
+            if action.destination is None:
+                return None
+            params: dict[str, Any] = {"waypoint": _coord_data(action.destination)}
+            if "cruise_speed" in action.parameters:
+                params["cruise_speed"] = float(action.parameters["cruise_speed"])
+            return {
+                "id": cmd_id,
+                "kind": "UAV_GOTO",
+                "target": action.target_id,
+                "priority": priority,
+                "params": params,
+            }
+
         if action.kind == "dispatch_vehicle":
-            target = action.target_id.upper()
-            if target.startswith("UGV"):
-                return "UGV_DISPATCH"
-            if "POLICE" in target or target.startswith("POL"):
-                return "POLICE_DISPATCH"
-            return "VEHICLE_DISPATCH"
-        return self.action_map.get(action.kind, action.kind.upper())
+            if action.destination is None:
+                return None
+            incident_id = self._match_fire_incident(action)
+            if incident_id is not None:
+                return {
+                    "id": cmd_id,
+                    "kind": "UGV_EXTINGUISH",
+                    "target": action.target_id,
+                    "priority": priority,
+                    "params": {"incident_id": incident_id},
+                }
+            params = {"dest": _coord_data(action.destination)}
+            if "target_speed" in action.parameters:
+                params["target_speed"] = float(action.parameters["target_speed"])
+            return {
+                "id": cmd_id,
+                "kind": "UGV_GOTO",
+                "target": action.target_id,
+                "priority": priority,
+                "params": params,
+            }
+
+        return None
+
+    def _match_fire_incident(self, action: UrbanAction) -> str | None:
+        intent = str(action.parameters.get("intent", "") or "").lower()
+        capability = str(action.parameters.get("capability", "") or "").lower()
+        reason = (action.reason or "").lower()
+        wants_extinguish = (
+            intent == "extinguish"
+            or capability == "fire_suppression"
+            or "extinguish" in reason
+            or "灭火" in (action.reason or "")
+        )
+        if not wants_extinguish:
+            return None
+        state = self._latest_state
+        if state is None:
+            return None
+        ugv = next(
+            (r for r in state.resources if r.id == action.target_id),
+            None,
+        )
+        if ugv is None:
+            return None
+        best_id: str | None = None
+        best_dist = self.extinguish_radius_m
+        for inc in state.incidents:
+            if str(inc.kind).lower() != "fire":
+                continue
+            dist = _distance(inc.position, ugv.position)
+            if dist <= best_dist:
+                best_dist = dist
+                best_id = inc.id
+        return best_id
 
 
 def carla_snapshot_to_city_state(
@@ -309,10 +529,15 @@ def carla_snapshot_to_city_state(
     timestamp: str = "",
     default_incidents: list[Incident] | None = None,
 ) -> CityState:
+    """Translate a protocol v1.0 ``state_snapshot.payload`` into ``CityState``."""
+
     resources: list[UrbanResource] = []
     for raw in payload.get("vehicles") or []:
-        if isinstance(raw, dict):
-            resources.append(_vehicle_resource(raw))
+        if not isinstance(raw, dict):
+            continue
+        if str(raw.get("role", "")).lower() == "civilian":
+            continue
+        resources.append(_vehicle_resource(raw))
     for raw in payload.get("uavs") or []:
         if isinstance(raw, dict):
             resources.append(_uav_resource(raw))
@@ -339,24 +564,21 @@ def carla_snapshot_to_city_state(
 def _vehicle_resource(raw: dict[str, Any]) -> UrbanResource:
     rid = str(raw.get("id", ""))
     role = str(raw.get("role", "")).lower()
-    upper = rid.upper()
-    if "POLICE" in role or "POLICE" in upper or upper.startswith("POL"):
-        kind = "police_car"
-        caps = ["traffic_control", "perimeter_control"]
-    elif upper.startswith("UGV"):
+    if role == "dispatchable":
         kind = "unmanned_vehicle"
-        caps = ["logistics_support", "perimeter_support"]
+        caps = ["logistics_support", "perimeter_support", "fire_suppression"]
     else:
         kind = "ground_vehicle"
         caps = ["ground_mobility"]
+    speed = _maybe_float(raw.get("speed")) or 0.0
+    status = "dispatched" if speed > 0.1 else "available"
     return UrbanResource(
         id=rid,
         kind=kind,  # type: ignore[arg-type]
-        position=_coord_required(raw.get("position")),
-        status=_resource_status(str(raw.get("state", "idle"))),
-        speed=float(raw.get("speed", 1.0) or 1.0),
+        position=_coord_from_pose(raw.get("pose")),
+        status=status,  # type: ignore[arg-type]
+        speed=float(speed),
         battery_remaining=_maybe_float(raw.get("battery")),
-        payload_remaining=_maybe_float(raw.get("payload")),
         capabilities=caps,
         label=rid,
     )
@@ -364,12 +586,18 @@ def _vehicle_resource(raw: dict[str, Any]) -> UrbanResource:
 
 def _uav_resource(raw: dict[str, Any]) -> UrbanResource:
     rid = str(raw.get("id", ""))
+    role = str(raw.get("role", "")).lower()
+    speed = _maybe_float(raw.get("speed")) or 0.0
+    if role == "patrol":
+        status = "available"
+    else:
+        status = "dispatched" if speed > 0.1 else "available"
     return UrbanResource(
         id=rid,
         kind="drone",
-        position=_coord_required(raw.get("position")),
-        status=_resource_status(str(raw.get("state", "hover"))),
-        speed=float(raw.get("speed", 2.0) or 2.0),
+        position=_coord_from_pose(raw.get("pose")),
+        status=status,  # type: ignore[arg-type]
+        speed=float(speed),
         battery_remaining=_maybe_float(raw.get("battery")),
         capabilities=["aerial_recon", "thermal_imaging"],
         label=rid,
@@ -379,8 +607,8 @@ def _uav_resource(raw: dict[str, Any]) -> UrbanResource:
 def _traffic_signal(raw: dict[str, Any]) -> TrafficSignal:
     return TrafficSignal(
         id=str(raw.get("id", "")),
-        position=_coord_required(raw.get("position")),
-        mode=str(raw.get("state", raw.get("mode", "normal"))),
+        position=_coord_from_pose(raw.get("pose")),
+        mode=str(raw.get("phase", "unknown")),
         status="available",
     )
 
@@ -389,24 +617,30 @@ def _incident(raw: dict[str, Any]) -> Incident:
     return Incident(
         id=str(raw.get("id", "")),
         kind=str(raw.get("kind", "fire")),  # type: ignore[arg-type]
-        position=_coord_required(raw.get("position")),
+        position=_coord_from_position(raw.get("position")),
         severity=str(raw.get("severity", "high")),  # type: ignore[arg-type]
-        status=str(raw.get("status", "open")),  # type: ignore[arg-type]
+        status="open",
         description=str(raw.get("description", "")),
     )
 
 
-def _resource_status(state: str):
-    s = state.strip().lower()
-    if s in {"moving", "taking_off", "landing"}:
-        return "dispatched"
-    if s in {"error", "offline"}:
-        return "offline"
-    return "available"
+def _coord_from_pose(value: Any) -> Coordinate:
+    """Decode ``pose: [x, y, z]`` (protocol §3.2 array form)."""
+
+    if isinstance(value, (list, tuple)):
+        x = float(value[0]) if len(value) > 0 else 0.0
+        y = float(value[1]) if len(value) > 1 else 0.0
+        z = float(value[2]) if len(value) > 2 else 0.0
+        return Coordinate(x=x, y=y, z=z)
+    if isinstance(value, dict):
+        return _coord_from_position(value)
+    return Coordinate(x=0.0, y=0.0, z=0.0)
 
 
-def _coord_required(raw: Any) -> Coordinate:
-    d = raw if isinstance(raw, dict) else {}
+def _coord_from_position(value: Any) -> Coordinate:
+    """Decode ``position: {x, y, z}`` (protocol §3.2 object form)."""
+
+    d = value if isinstance(value, dict) else {}
     return Coordinate(
         x=float(d.get("x", 0.0) or 0.0),
         y=float(d.get("y", 0.0) or 0.0),
@@ -416,6 +650,14 @@ def _coord_required(raw: Any) -> Coordinate:
 
 def _coord_data(coord: Coordinate) -> dict[str, float]:
     return {"x": coord.x, "y": coord.y, "z": coord.z}
+
+
+def _distance(left: Coordinate, right: Coordinate) -> float:
+    return math.sqrt(
+        (left.x - right.x) ** 2
+        + (left.y - right.y) ** 2
+        + (left.z - right.z) ** 2
+    )
 
 
 def _maybe_int(value: Any) -> int | None:
@@ -432,25 +674,35 @@ def _maybe_float(value: Any) -> float | None:
         return None
 
 
-def _as_envelope(event_type: str, data: Any) -> dict[str, Any]:
+def _as_envelope(data: Any) -> dict[str, Any]:
     if isinstance(data, dict) and "payload" in data:
         return data
     return {
-        "version": "1.0",
+        "version": PROTOCOL_VERSION,
         "msg_id": "",
-        "type": event_type,
+        "type": "",
         "timestamp": time.time(),
         "frame": None,
         "sim_time": None,
-        "sender": "middleware",
+        "sender": "bridge",
         "payload": data if isinstance(data, dict) else {},
     }
 
 
-def _pending_action(payload: dict[str, Any]) -> UrbanAction:
+def _unwrap_payload(data: Any) -> dict[str, Any]:
+    env = _as_envelope(data)
+    payload = env.get("payload")
+    return dict(payload) if isinstance(payload, dict) else {}
+
+
+def _major(version: str) -> str:
+    return version.split(".", 1)[0]
+
+
+def _placeholder_action(payload: dict[str, Any]) -> UrbanAction:
     return UrbanAction(
         kind="dispatch_vehicle",
-        target_id=str(payload.get("target", "")),
-        parameters={"bridge_payload": payload},
-        reason="CarlaBridge command ack/reject",
+        target_id=str(payload.get("target", "") or ""),
+        parameters={"cmd_id": str(payload.get("cmd_id", "") or "")},
+        reason="command_status received without matching local action",
     )

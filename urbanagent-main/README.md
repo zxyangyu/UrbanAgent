@@ -6,13 +6,15 @@
 
 ## CarlaBridge 接入协议
 
-本项目按照 **Urban Agent 接入 CarlaBridge 开发者指南 (v1.1)** 接入中间件，不直接连接 CARLA。
+本项目按照 **Bridge × Agent Protocol v1.0**（`bridge-agent-protocol-v1.md`）接入中间件，不直接连接 CARLA。
 
 - 协议：Socket.IO v4.x（基于 WebSocket）
 - URL：`http://<bridge_ip>:<port>`，默认 `http://localhost:5000`
 - Namespace：`/agent`
-- CarlaBridge 配置：`[agent] mode = "remote"`
-- 坐标：CARLA 左手系笛卡尔坐标，单位米，`x/y/z` 与 Bridge 快照一致
+- 协议版本字段：`version = "1.0"`
+- 坐标：CARLA 左手系笛卡尔坐标，单位米。**注意**协议对坐标用两种形式：
+  - `vehicles[].pose / uavs[].pose / traffic_lights[].pose` 是 `[x, y, z]` 数组
+  - `incidents[].position` 和命令参数（`waypoint` / `dest` / `position`）是 `{x, y, z}` 字典
 
 Agent 侧客户端是：
 
@@ -20,21 +22,21 @@ Agent 侧客户端是：
 from urbanagent import CarlaBridgeSandboxClient
 ```
 
-它实现了 CarlaBridge v1.1 的应用层行为：
+它的行为：
 
-- 连接 `/agent` 后发送 `hello`
-- 每 1 秒发送 Envelope `ping`，接收 `pong`
+- 连接 `/agent` 后通过 `sio.call("hello", {agent_id, version})` 完成握手；保存 `bridge_session_id`（用于检测 Bridge 重启）
 - 监听 Bridge 下行：
-  - `state.snapshot`
-  - `suggestion`
-  - `agent_ack`
-  - `agent_reject`
-  - `event_log`
-- 上行发送：
-  - `agent_command`
-  - `event_log`
-  - `hello`
-  - `ping`
+  - `state_snapshot`（10 Hz；包含 `run_id` / `bridge_session_id` / `in_flight_commands`）
+  - `command_status`（命令生命周期：`accepted / ongoing / completed / failed / cancelled`）
+  - `scenario_event`（v1.0 仅 `event="reset"`，会取消所有未决命令）
+  - `event_log`（仅记录，不进入决策）
+- 上行通过 `sio.call("agent.command", envelope)` 同步等待 `accepted/rejected`，再异步等待终态 `command_status` 才把结果返回给 batch_runner
+- `send_action()` 把 `UrbanAction` 翻译为 v1.0 的 8 类命令之一：
+  - `dispatch_drone` → `UAV_GOTO`（参数 `waypoint`）
+  - `dispatch_vehicle` → `UGV_GOTO`（参数 `dest`），当 `parameters["intent"]="extinguish"` 且目标距离某 `fire` 类 incident ≤ 5 m 时升级为 `UGV_EXTINGUISH`
+  - `control_traffic_light` / `mark_incident` 不在 v1.0 协议内，适配层立即返回 `rejected` 并写 warning 级 `event_log`
+
+> ℹ **目标实体校验**：`UrbanAction.target_id` 会由适配层与最近一次 `state_snapshot.vehicles / uavs` 的 ID 集合比对，未匹配（如 LLM 幻觉出 `drone-01`）会在 RPC 发出前本地驳回（`rejected: unknown_target ...`）并写 warning 级 `event_log`，避免到 Bridge 才返回 `unknown_target`。子 Agent 通过 `state.resources` 选 target 时已经会得到合规 ID，校验仅作防御。
 
 所有消息使用 Envelope：`version/msg_id/type/timestamp/frame/sim_time/sender/payload`。
 
@@ -73,7 +75,7 @@ $env:AGENT_LAB_CHAT_JSON_OBJECT="1"
 
 ```bash
 python scripts/multiagent_smoke.py
-python -m unittest tests.test_multiagent_mvp tests.test_carla_bridge_adapter -v
+python -m unittest tests.test_multiagent_mvp tests.test_carla_bridge_protocol_v1 -v
 ```
 
 预期：测试全部通过，`multiagent_smoke.py` 输出 `ok ... actions`。
@@ -81,11 +83,6 @@ python -m unittest tests.test_multiagent_mvp tests.test_carla_bridge_adapter -v
 ## 连接 CarlaBridge 运行
 
 确保 CarlaBridge 已启动，并在配置中开启：
-
-```toml
-[agent]
-mode = "remote"
-```
 
 运行：
 

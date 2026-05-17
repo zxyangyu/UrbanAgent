@@ -33,6 +33,24 @@ async def main() -> int:
     parser.add_argument("--incident-x", type=float, default=0.0)
     parser.add_argument("--incident-y", type=float, default=0.0)
     parser.add_argument("--incident-z", type=float, default=0.0)
+    parser.add_argument(
+        "--command-timeout",
+        type=float,
+        default=180.0,
+        help="Seconds to wait for a terminal command_status before giving up.",
+    )
+    parser.add_argument(
+        "--ack-timeout",
+        type=float,
+        default=2.0,
+        help="Seconds to wait for the agent.command RPC ack.",
+    )
+    parser.add_argument(
+        "--state-timeout",
+        type=float,
+        default=30.0,
+        help="Seconds to wait for the first state_snapshot.",
+    )
     args = parser.parse_args()
 
     fallback_incident = Incident(
@@ -46,6 +64,9 @@ async def main() -> int:
         args.url,
         namespace=args.namespace,
         default_incidents=[fallback_incident],
+        command_timeout=args.command_timeout,
+        ack_timeout=args.ack_timeout,
+        state_timeout=args.state_timeout,
     )
     agent = UrbanMultiAgentSystem(
         sandbox=sandbox,
