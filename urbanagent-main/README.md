@@ -165,15 +165,20 @@ asyncio.run(main())
 - 执行：元智能体整合为有序 `agent_command` 批次，逐条发给 CarlaBridge
 - 闭环：收到 `agent_ack` / `agent_reject` 后，整批结束再通过 `state.snapshot` 判据轮询确认
 
-## LangGraph + DefenseAgent 独立项目
+## 仓库结构与 DefenseAgent
 
-LangGraph + DefenseAgent 版本已经从本仓库完全拆出，位于：
+本 GitHub 仓库根目录包含两个**并列、解耦**的子项目：
 
-```text
-D:\论文代码\urbanagent_langgraph_defenseagent
-```
+| 目录 | 角色 |
+|------|------|
+| `urbanagent-main/`（本 README 所在目录） | **主线**：手写 `urbanagent.multiagent`，对接 CarlaBridge v1.0 |
+| `DefenseAgent-main/` | **独立框架**：通用 Agent 运行时（ReAct、工具注册、记忆、RAG、profile 等） |
 
-当前仓库继续保留手写 `urbanagent.multiagent` 作为 CarlaBridge baseline。独立项目拥有自己的 `pyproject.toml`、README、源码包、profiles、demo 脚本和测试，可单独安装、运行和演进。
+**`urbanagent` 主线不依赖 `DefenseAgent-main`。** 安装与运行多智能体 demo 只需本目录的 `pyproject.toml`；`DefenseAgent` 未列入依赖，运行时也不会 import 它。
+
+当前多智能体的元智能体与子 Agent（无人机 / 无人车 / 警车 / 信号灯）均由 `urbanagent` 包内实现；子 Agent 可选使用 `urbanagent.llm` 做 S0–S2，S3 使用 `SubAgentToolkit` + `DispatchPolicy` 确定性规划。
+
+`DefenseAgent-main` 保留在仓库中，供**后续升级智能体能力**时使用，例如：将某类子 Agent 替换为基于 profile 的 ReAct Agent、接入 MCP/技能/RAG、或引入 LangGraph 编排等。上述演进属于可选路线，**不影响**现有 CarlaBridge baseline 的安装、测试与联调。
 
 ## CarlaBridge 动作映射
 
