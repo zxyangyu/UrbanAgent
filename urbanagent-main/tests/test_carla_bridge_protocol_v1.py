@@ -327,6 +327,97 @@ class SendActionTest(unittest.IsolatedAsyncioTestCase):
         result, _ = await asyncio.gather(client.send_action(action), push_completed_after_ack())
         self.assertEqual(result.status, "applied")
 
+    async def test_patrol_drone_maps_to_uav_patrol(self) -> None:
+        client = CarlaBridgeSandboxClient("http://test")
+        fake = FakeAsyncClient()
+        await _connect_with_fake(client, fake)
+
+        fake.call_responder = lambda event, payload: (
+            {"status": "accepted", "cmd_id": payload["payload"]["id"], "queued_at_sim_time": 0.0}
+            if event == "agent.command" else None
+        )
+        action = UrbanAction(
+            kind="patrol_drone",
+            target_id="UAV-01",
+            parameters={
+                "path": [Coordinate(0, 0, 60), Coordinate(10, 0, 60)],
+                "loop": True,
+            },
+        )
+
+        async def push_ongoing() -> None:
+            await asyncio.sleep(0)
+            inner = fake.calls[-1][1]["payload"]
+            self.assertEqual(inner["kind"], "UAV_PATROL")
+            self.assertEqual(
+                inner["params"]["path"],
+                [
+                    {"x": 0, "y": 0, "z": 60},
+                    {"x": 10, "y": 0, "z": 60},
+                ],
+            )
+            self.assertEqual(inner["params"]["cruise_speed"], 8.0)
+            self.assertTrue(inner["params"]["loop"])
+            await fake.deliver(
+                "command_status",
+                _envelope(
+                    "command_status",
+                    {
+                        "cmd_id": inner["id"],
+                        "status": "ongoing",
+                        "kind": "UAV_PATROL",
+                        "target": "UAV-01",
+                    },
+                ),
+            )
+
+        result, _ = await asyncio.gather(client.send_action(action), push_ongoing())
+        self.assertEqual(result.status, "applied")
+        self.assertIn("ongoing", result.message)
+
+    async def test_return_actions_map_to_rtl_commands(self) -> None:
+        client = CarlaBridgeSandboxClient("http://test")
+        fake = FakeAsyncClient()
+        await _connect_with_fake(client, fake)
+
+        fake.call_responder = lambda event, payload: (
+            {"status": "accepted", "cmd_id": payload["payload"]["id"], "queued_at_sim_time": 0.0}
+            if event == "agent.command" else None
+        )
+
+        async def send_and_complete(action: UrbanAction, expected_kind: str) -> ActionResult:
+            async def push_completed() -> None:
+                await asyncio.sleep(0)
+                inner = fake.calls[-1][1]["payload"]
+                self.assertEqual(inner["kind"], expected_kind)
+                await fake.deliver(
+                    "command_status",
+                    _envelope(
+                        "command_status",
+                        {
+                            "cmd_id": inner["id"],
+                            "status": "completed",
+                            "kind": expected_kind,
+                            "target": action.target_id,
+                        },
+                    ),
+                )
+
+            result, _ = await asyncio.gather(client.send_action(action), push_completed())
+            return result
+
+        drone_result = await send_and_complete(
+            UrbanAction(kind="return_drone", target_id="UAV-01"),
+            "UAV_RTL",
+        )
+        vehicle_result = await send_and_complete(
+            UrbanAction(kind="return_vehicle", target_id="UGV-01"),
+            "UGV_RTL",
+        )
+
+        self.assertEqual(drone_result.status, "applied")
+        self.assertEqual(vehicle_result.status, "applied")
+
     async def test_dispatch_vehicle_upgrades_to_extinguish(self) -> None:
         client = CarlaBridgeSandboxClient("http://test")
         fake = FakeAsyncClient()

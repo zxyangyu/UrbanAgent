@@ -22,6 +22,11 @@ StationKind = Literal["fire_station", "police_station", "drone_base"]
 ActionKind = Literal[
     "dispatch_vehicle",
     "dispatch_drone",
+    "patrol_drone",
+    "return_drone",
+    "hold_drone",
+    "return_vehicle",
+    "stop_vehicle",
     "control_traffic_light",
     "mark_incident",
 ]

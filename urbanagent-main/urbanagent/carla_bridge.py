@@ -183,7 +183,7 @@ class CarlaBridgeSandboxClient(SandboxClient):
             await self._emit_event_log(severity="warn", message=message)
             return ActionResult(status="rejected", action=action, message=message)
 
-        conflict = self._in_flight_conflict(cmd_payload["target"])
+        conflict = self._in_flight_conflict(cmd_payload)
         if conflict is not None:
             message = (
                 f"target_in_flight: {cmd_payload['target']!r} already has command "
@@ -251,7 +251,9 @@ class CarlaBridgeSandboxClient(SandboxClient):
         await self.connect()
         await self._emit_event_log(severity=severity, message=message, cmd_id=cmd_id)
 
-    def _in_flight_conflict(self, target_id: str) -> dict[str, Any] | None:
+    def _in_flight_conflict(self, cmd_payload: dict[str, Any]) -> dict[str, Any] | None:
+        target_id = str(cmd_payload.get("target", "") or "")
+        new_kind = str(cmd_payload.get("kind", "") or "")
         terminal = {"completed", "failed", "cancelled"}
         for item in self._latest_in_flight:
             target = str(item.get("target", "") or "")
@@ -259,6 +261,13 @@ class CarlaBridgeSandboxClient(SandboxClient):
                 continue
             status = str(item.get("status", "") or "").lower()
             if status not in terminal:
+                existing_kind = str(item.get("kind", "") or "")
+                if existing_kind == "UAV_PATROL" and new_kind in {
+                    "UAV_GOTO",
+                    "UAV_RTL",
+                    "UAV_HOLD",
+                }:
+                    continue
                 return item
         return None
 
@@ -480,6 +489,66 @@ class CarlaBridgeSandboxClient(SandboxClient):
         cmd_id = f"urbanagent-{uuid.uuid4().hex[:12]}"
         priority = str(action.parameters.get("priority", "normal"))
 
+        if action.kind == "patrol_drone":
+            path = _patrol_path_data(action)
+            if not path:
+                return None
+            return {
+                "id": cmd_id,
+                "kind": "UAV_PATROL",
+                "target": action.target_id,
+                "priority": priority,
+                "params": {
+                    "path": path,
+                    "cruise_speed": float(
+                        action.parameters.get("cruise_speed", DEFAULT_UAV_CRUISE_SPEED)
+                    ),
+                    "loop": bool(action.parameters.get("loop", True)),
+                },
+            }
+
+        if action.kind == "return_drone":
+            params: dict[str, Any] = {}
+            if "cruise_speed" in action.parameters:
+                params["cruise_speed"] = float(action.parameters["cruise_speed"])
+            return {
+                "id": cmd_id,
+                "kind": "UAV_RTL",
+                "target": action.target_id,
+                "priority": priority,
+                "params": params,
+            }
+
+        if action.kind == "hold_drone":
+            return {
+                "id": cmd_id,
+                "kind": "UAV_HOLD",
+                "target": action.target_id,
+                "priority": priority,
+                "params": {},
+            }
+
+        if action.kind == "return_vehicle":
+            params = {}
+            if "target_speed" in action.parameters:
+                params["target_speed"] = float(action.parameters["target_speed"])
+            return {
+                "id": cmd_id,
+                "kind": "UGV_RTL",
+                "target": action.target_id,
+                "priority": priority,
+                "params": params,
+            }
+
+        if action.kind == "stop_vehicle":
+            return {
+                "id": cmd_id,
+                "kind": "UGV_STOP",
+                "target": action.target_id,
+                "priority": priority,
+                "params": {},
+            }
+
         if action.kind == "dispatch_drone":
             if action.destination is None:
                 return None
@@ -685,6 +754,31 @@ def _coord_from_position(value: Any) -> Coordinate:
 
 def _coord_data(coord: Coordinate) -> dict[str, float]:
     return {"x": coord.x, "y": coord.y, "z": coord.z}
+
+
+def _patrol_path_data(action: UrbanAction) -> list[dict[str, float]]:
+    raw_path = action.parameters.get("path")
+    if raw_path is None and action.destination is not None:
+        raw_path = [action.destination]
+    if not isinstance(raw_path, list):
+        return []
+    path: list[dict[str, float]] = []
+    for item in raw_path:
+        if isinstance(item, Coordinate):
+            path.append(_coord_data(item))
+        elif isinstance(item, dict):
+            if not {"x", "y", "z"}.issubset(item):
+                return []
+            path.append(
+                {
+                    "x": float(item["x"]),
+                    "y": float(item["y"]),
+                    "z": float(item["z"]),
+                }
+            )
+        else:
+            return []
+    return path
 
 
 def _distance(left: Coordinate, right: Coordinate) -> float:

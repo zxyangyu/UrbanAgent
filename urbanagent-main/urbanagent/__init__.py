@@ -5,7 +5,11 @@ from __future__ import annotations
 from urbanagent.carla_bridge import CarlaBridgeSandboxClient
 from urbanagent.dispatch import DispatchPolicy, assignment_to_action
 from urbanagent.errors import SandboxWireError
-from urbanagent.multiagent import UrbanMultiAgentResult, UrbanMultiAgentSystem
+from urbanagent.multiagent import (
+    PatrolFireResponseResult,
+    UrbanMultiAgentResult,
+    UrbanMultiAgentSystem,
+)
 from urbanagent.routing import (
     ExternalMapRoutePlanner,
     LocalGraphRoutePlanner,
@@ -66,6 +70,7 @@ __all__ = [
     "UrbanMultiAgentSystem",
     "UrbanResource",
     "UrbanTask",
+    "PatrolFireResponseResult",
     "assignment_to_action",
     "build_single_fire_state",
 ]

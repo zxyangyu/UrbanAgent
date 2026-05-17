@@ -93,3 +93,15 @@ class UrbanMultiAgentResult:
     initial_state: CityState | None = None
     llm_used: bool = False
     skipped_reason: str = ""
+
+
+@dataclass
+class PatrolFireResponseResult:
+    """Patrol → fire detection → dispatch → return-to-base workflow result."""
+
+    patrol_outcome: BatchOutcome | None = None
+    detected_incident_id: str | None = None
+    detection_notes: list[str] = field(default_factory=list)
+    response: UrbanMultiAgentResult | None = None
+    return_outcome: BatchOutcome | None = None
+    final_report: str = ""

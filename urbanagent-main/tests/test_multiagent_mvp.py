@@ -126,6 +126,72 @@ class MultiAgentMVPTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(ugv_actions[0].parameters.get("force_extinguish", False))
         self.assertTrue(ugv_actions[1].parameters.get("force_extinguish"))
 
+    async def test_patrol_detects_fire_dispatches_and_returns(self) -> None:
+        state = CityState(
+            timestamp="t0",
+            incidents=[],
+            resources=[
+                UrbanResource(
+                    id="UAV-01",
+                    kind="drone",
+                    position=Coordinate(0, 0, 60),
+                    battery_remaining=100.0,
+                    capabilities=["aerial_recon"],
+                ),
+                UrbanResource(
+                    id="UGV-01",
+                    kind="unmanned_vehicle",
+                    position=Coordinate(0, 0, 0),
+                    capabilities=["fire_suppression", "logistics_support"],
+                ),
+            ],
+            traffic_signals=[
+                TrafficSignal(id="signal-01", position=Coordinate(10, 10, 0)),
+            ],
+        )
+
+        class FireDiscoverySandbox(MockSandboxClient):
+            async def send_action(self, action):
+                result = await super().send_action(action)
+                if action.kind == "patrol_drone" and not self._state.incidents:
+                    self._state.incidents.append(
+                        Incident(
+                            id="incident-fire-001",
+                            kind="fire",
+                            severity="high",
+                            position=Coordinate(10, 10, 0),
+                        )
+                    )
+                return result
+
+        sandbox = FireDiscoverySandbox(state)
+        sys = UrbanMultiAgentSystem(
+            sandbox=sandbox,
+            use_llm=False,
+            use_llm_batch_rerank=False,
+        )
+
+        result = await sys.run_patrol_fire_response(
+            detection_poll_interval_s=0.0,
+            max_detection_rounds=1,
+        )
+
+        self.assertEqual(result.detected_incident_id, "incident-fire-001")
+        self.assertIsNotNone(result.patrol_outcome)
+        self.assertTrue(result.patrol_outcome.criteria_satisfied)
+        self.assertIsNotNone(result.response)
+        self.assertTrue(result.response.batch_outcome.criteria_satisfied)
+        self.assertIsNotNone(result.return_outcome)
+        self.assertTrue(result.return_outcome.criteria_satisfied)
+
+        applied_kinds = [r.action.kind for r in sandbox.applied_results]
+        self.assertIn("patrol_drone", applied_kinds)
+        self.assertIn("dispatch_vehicle", applied_kinds)
+        self.assertIn("dispatch_drone", applied_kinds)
+        self.assertIn("return_vehicle", applied_kinds)
+        self.assertIn("return_drone", applied_kinds)
+        self.assertEqual(state.incidents[0].status, "resolved")
+
 
 if __name__ == "__main__":
     unittest.main()

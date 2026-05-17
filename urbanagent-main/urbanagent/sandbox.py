@@ -60,6 +60,12 @@ class MockSandboxClient(SandboxClient):
     async def send_action(self, action: UrbanAction) -> ActionResult:
         if action.kind in {"dispatch_vehicle", "dispatch_drone"}:
             result = self._dispatch_mobile_resource(action)
+        elif action.kind == "patrol_drone":
+            result = self._patrol_drone(action)
+        elif action.kind in {"return_drone", "return_vehicle"}:
+            result = self._return_resource(action)
+        elif action.kind in {"hold_drone", "stop_vehicle"}:
+            result = self._instant_mobile_command(action)
         elif action.kind == "control_traffic_light":
             result = self._control_traffic_light(action)
         elif action.kind == "mark_incident":
@@ -87,7 +93,8 @@ class MockSandboxClient(SandboxClient):
                 action=action,
                 message=f"resource not found: {action.target_id}",
             )
-        if resource.status != "available":
+        force_extinguish = bool(action.parameters.get("force_extinguish"))
+        if resource.status != "available" and not force_extinguish:
             return ActionResult(
                 status="rejected",
                 action=action,
@@ -115,6 +122,11 @@ class MockSandboxClient(SandboxClient):
             resource.battery_remaining = max(0.0, resource.battery_remaining - 15.0)
         if resource.payload_remaining is not None:
             resource.payload_remaining = max(0.0, resource.payload_remaining - 5.0)
+        if action.parameters.get("force_extinguish"):
+            incident_id = str(action.parameters.get("incident_id", "") or "")
+            incident = self._find_incident(incident_id)
+            if incident is not None and incident.kind == "fire":
+                incident.status = "resolved"
         return ActionResult(
             status="applied",
             action=action,
@@ -123,6 +135,104 @@ class MockSandboxClient(SandboxClient):
                 f"({action.destination.x:.1f}, {action.destination.y:.1f}); "
                 f"mock distance {distance:.1f}"
             ),
+        )
+
+    def _patrol_drone(self, action: UrbanAction) -> ActionResult:
+        resource = self._find_resource(action.target_id)
+        if resource is None:
+            return ActionResult(
+                status="rejected",
+                action=action,
+                message=f"resource not found: {action.target_id}",
+            )
+        if resource.kind != "drone":
+            return ActionResult(
+                status="rejected",
+                action=action,
+                message=f"resource {resource.id} is not a drone",
+            )
+        path = action.parameters.get("path") or []
+        if not path:
+            return ActionResult(
+                status="rejected",
+                action=action,
+                message="patrol_drone requires a non-empty path",
+            )
+        last = path[-1]
+        if isinstance(last, Coordinate):
+            resource.position = last
+        elif isinstance(last, dict):
+            resource.position = Coordinate(
+                float(last["x"]),
+                float(last["y"]),
+                float(last.get("z", resource.position.z)),
+            )
+        resource.status = "available"
+        resource.current_task_id = "patrol"
+        if resource.battery_remaining is not None:
+            resource.battery_remaining = max(0.0, resource.battery_remaining - 5.0)
+        return ActionResult(
+            status="applied",
+            action=action,
+            message=f"drone {resource.id} started patrol",
+        )
+
+    def _return_resource(self, action: UrbanAction) -> ActionResult:
+        resource = self._find_resource(action.target_id)
+        if resource is None:
+            return ActionResult(
+                status="rejected",
+                action=action,
+                message=f"resource not found: {action.target_id}",
+            )
+        if action.kind == "return_drone" and resource.kind != "drone":
+            return ActionResult(
+                status="rejected",
+                action=action,
+                message=f"resource {resource.id} is not a drone",
+            )
+        if action.kind == "return_vehicle" and resource.kind == "drone":
+            return ActionResult(
+                status="rejected",
+                action=action,
+                message=f"resource {resource.id} is a drone; use return_drone",
+            )
+        home = self._home_position(resource)
+        if home is not None:
+            resource.position = home
+        resource.status = "available"
+        resource.current_task_id = None
+        return ActionResult(
+            status="applied",
+            action=action,
+            message=f"{resource.kind} {resource.id} returned to base",
+        )
+
+    def _instant_mobile_command(self, action: UrbanAction) -> ActionResult:
+        resource = self._find_resource(action.target_id)
+        if resource is None:
+            return ActionResult(
+                status="rejected",
+                action=action,
+                message=f"resource not found: {action.target_id}",
+            )
+        if action.kind == "hold_drone" and resource.kind != "drone":
+            return ActionResult(
+                status="rejected",
+                action=action,
+                message=f"resource {resource.id} is not a drone",
+            )
+        if action.kind == "stop_vehicle" and resource.kind == "drone":
+            return ActionResult(
+                status="rejected",
+                action=action,
+                message=f"resource {resource.id} is a drone; use hold_drone",
+            )
+        resource.status = "available"
+        return ActionResult(
+            status="applied",
+            action=action,
+            message=f"{action.kind} applied to {resource.id}",
         )
 
     def _control_traffic_light(self, action: UrbanAction) -> ActionResult:
@@ -166,6 +276,18 @@ class MockSandboxClient(SandboxClient):
 
     def _find_incident(self, incident_id: str) -> Incident | None:
         return next((item for item in self._state.incidents if item.id == incident_id), None)
+
+    def _home_position(self, resource: UrbanResource) -> Coordinate | None:
+        if not resource.home_base_id:
+            return None
+        for base in (
+            list(self._state.drone_bases)
+            + list(self._state.fire_stations)
+            + list(self._state.police_stations)
+        ):
+            if base.id == resource.home_base_id:
+                return base.position
+        return None
 
 
 def build_single_fire_state() -> CityState:
