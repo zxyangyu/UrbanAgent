@@ -39,7 +39,7 @@ from urbanagent.types import CityState, Coordinate, Incident, UrbanAction, Urban
 # Demo / CARLA default fire-watch area (ground xy); patrol flies at patrol_altitude.
 DEFAULT_FIRE_WATCH_XY = (25.3, 24.4)
 # Match CarlaBridge s1_fire ``UAV_ARRIVAL_EPS_M``.
-PATROL_ARRIVAL_EPS_M = 2.0
+PATROL_ARRIVAL_EPS_M = 1.0
 
 
 class UrbanMultiAgentSystem:
