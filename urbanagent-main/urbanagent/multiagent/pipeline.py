@@ -39,7 +39,11 @@ from urbanagent.types import CityState, Coordinate, Incident, UrbanAction, Urban
 # Demo / CARLA default fire-watch area (ground xy); patrol flies at patrol_altitude.
 DEFAULT_FIRE_WATCH_XY = (25.3, 24.4)
 # Match CarlaBridge s1_fire ``UAV_ARRIVAL_EPS_M``.
-PATROL_ARRIVAL_EPS_M = 1.0
+PATROL_ARRIVAL_EPS_M = 1
+# Only this UAV must reach hold_anchor before hold dispatch (s1_fire primary watch).
+PATROL_ARRIVAL_WATCH_DRONE_ID = "UAV-01"
+# GOTO hover point offset from incident xy (negative = west in CARLA +x east).
+FIRE_HOLD_GOTO_X_OFFSET_M = -13.0
 
 
 class UrbanMultiAgentSystem:
@@ -191,8 +195,9 @@ class UrbanMultiAgentSystem:
         waypoint 2 = ``patrol_leg_m`` along ``patrol_forward_axis`` (+x or +y),
         then loop back. ``fire_watch_point`` is only used for post-detection hold.
 
-        After fire appears in the snapshot, wait until patrol UAV(s) reach the hold
-        anchor above the fire (via ongoing ``UAV_PATROL``), then ``hold_drone``.
+        After fire appears in the snapshot, ``UAV-01`` is sent ``UAV_GOTO`` to the
+        hold anchor above the fire, polled until arrival, then all patrol UAVs
+        receive ``hold_drone``.
         """
 
         watch_xy = fire_watch_point or Coordinate(
@@ -244,7 +249,7 @@ class UrbanMultiAgentSystem:
             )
 
         notes.append(f"fire_detected:{detected.id}")
-        hold_anchor = _fire_hold_anchor(detected, watch_xy, patrol_altitude)
+        goto_anchor = _fire_hold_goto_anchor(detected, watch_xy, patrol_altitude)
         arrival_poll_s = (
             detection_poll_interval_s
             if arrival_poll_interval_s is None
@@ -252,26 +257,14 @@ class UrbanMultiAgentSystem:
         )
         hold_outcome: BatchOutcome | None = None
         if patrol_outcome is not None and patrol_drone_ids:
-            arrived = await self._wait_for_patrol_at_fire_anchor(
-                patrol_drone_ids,
-                hold_anchor,
-                poll_interval_s=arrival_poll_s,
-                max_rounds=max_arrival_rounds,
+            hold_outcome, hold_notes = await self._execute_patrol_fire_hold(
+                patrol_drone_ids=patrol_drone_ids,
+                goto_anchor=goto_anchor,
+                detected=detected,
+                arrival_poll_s=arrival_poll_s,
+                max_arrival_rounds=max_arrival_rounds,
             )
-            if arrived:
-                notes.append("patrol_arrived:fire_anchor")
-            else:
-                notes.append("patrol_arrival_timeout")
-            hold_actions = self._build_patrol_hold_actions(patrol_drone_ids)
-            if hold_actions:
-                hold_outcome = await execute_batch_ordered(
-                    self.sandbox,
-                    f"hold-{uuid.uuid4().hex[:8]}",
-                    hold_actions,
-                )
-                notes.append(f"hold_started:{len(hold_actions)}")
-            else:
-                notes.append("hold_skipped:no_patrol_uav")
+            notes.extend(hold_notes)
         else:
             notes.append("hold_skipped:no_active_patrol")
             hold_state = copy.deepcopy(await self.sandbox.get_state())
@@ -279,7 +272,7 @@ class UrbanMultiAgentSystem:
                 hold_state,
                 detected,
                 patrol_drone_ids,
-                patrol_altitude=patrol_altitude,
+                hold_position=goto_anchor,
             )
             if fallback_actions:
                 hold_outcome = await execute_batch_ordered(
@@ -403,33 +396,75 @@ class UrbanMultiAgentSystem:
             )
         return actions
 
-    def _build_patrol_hold_actions(self, drone_ids: list[str]) -> list[UrbanAction]:
-        """UAV_HOLD after patrol has reached the fire-watch anchor."""
-        return [
-            UrbanAction(
-                kind="hold_drone",
-                target_id=drone_id,
-                parameters={"role": "fire_watch_hold"},
-                reason="hold above fire after patrol arrival",
+    async def _execute_patrol_fire_hold(
+        self,
+        *,
+        patrol_drone_ids: list[str],
+        goto_anchor: Coordinate,
+        detected: Incident,
+        arrival_poll_s: float,
+        max_arrival_rounds: int,
+    ) -> tuple[BatchOutcome | None, list[str]]:
+        """GOTO fire watch point with watch UAV (UAV-01), wait, then HOLD all patrol drones."""
+        notes: list[str] = []
+        watch_ids = _patrol_arrival_watch_drone_ids(patrol_drone_ids)
+        hold_state = copy.deepcopy(await self.sandbox.get_state())
+        goto_actions = self._build_fire_hold_goto_actions(
+            hold_state,
+            watch_ids,
+            goto_anchor,
+            detected.id,
+            reason=f"goto above fire {detected.id} after patrol detection",
+        )
+        if goto_actions:
+            goto_outcome = await execute_batch_ordered(
+                self.sandbox,
+                f"goto-{uuid.uuid4().hex[:8]}",
+                goto_actions,
             )
-            for drone_id in drone_ids
-        ]
+            notes.append(f"watch_goto_started:{len(goto_actions)}")
+            if not goto_outcome.criteria_satisfied:
+                notes.extend(goto_outcome.notes)
+            arrived = await self._wait_for_patrol_at_fire_anchor(
+                [a.target_id for a in goto_actions],
+                goto_anchor,
+                poll_interval_s=arrival_poll_s,
+                max_rounds=max_arrival_rounds,
+            )
+            if arrived:
+                notes.append("watch_goto_arrived:fire_anchor")
+            else:
+                notes.append("watch_goto_arrival_timeout")
+        else:
+            notes.append("watch_goto_skipped:no_watch_uav")
 
-    def _build_fire_hold_actions_goto_then_hold(
+        hold_actions = self._build_patrol_hold_actions(patrol_drone_ids)
+        if not hold_actions:
+            notes.append("hold_skipped:no_patrol_uav")
+            return None, notes
+        hold_outcome = await execute_batch_ordered(
+            self.sandbox,
+            f"hold-{uuid.uuid4().hex[:8]}",
+            hold_actions,
+        )
+        notes.append(f"hold_started:{len(hold_actions)}")
+        return hold_outcome, notes
+
+    def _build_patrol_hold_actions(self, drone_ids: list[str]) -> list[UrbanAction]:
+        """UAV_HOLD after watch UAV has reached the fire hold anchor."""
+        return self._build_fire_hold_actions(drone_ids)
+
+    def _build_fire_hold_goto_actions(
         self,
         state: CityState,
-        incident: Incident,
         drone_ids: list[str],
+        hold_position: Coordinate,
+        incident_id: str,
         *,
-        patrol_altitude: float,
+        reason: str | None = None,
     ) -> list[UrbanAction]:
-        """Fallback when patrol was skipped: GOTO anchor, then HOLD."""
         resources = {r.id: r for r in state.resources}
-        hold_position = _fire_hold_anchor(
-            incident,
-            Coordinate(incident.position.x, incident.position.y, incident.position.z),
-            patrol_altitude,
-        )
+        goto_reason = reason or f"goto above fire {incident_id}"
         actions: list[UrbanAction] = []
         for drone_id in drone_ids:
             resource = resources.get(drone_id)
@@ -444,18 +479,51 @@ class UrbanMultiAgentSystem:
                         "cruise_speed": 8.0,
                         "role": "fire_confirmation_hover",
                     },
-                    reason=f"goto above fire {incident.id} (no patrol leg)",
-                )
-            )
-            actions.append(
-                UrbanAction(
-                    kind="hold_drone",
-                    target_id=drone_id,
-                    parameters={"role": "fire_watch_hold"},
-                    reason=f"hold above fire {incident.id} before dispatch",
+                    reason=goto_reason,
                 )
             )
         return actions
+
+    def _build_fire_hold_actions(self, drone_ids: list[str]) -> list[UrbanAction]:
+        return [
+            UrbanAction(
+                kind="hold_drone",
+                target_id=drone_id,
+                parameters={"role": "fire_watch_hold"},
+                reason="hold above fire after watch goto",
+            )
+            for drone_id in drone_ids
+        ]
+
+    def _build_fire_hold_actions_goto_then_hold(
+        self,
+        state: CityState,
+        incident: Incident,
+        drone_ids: list[str],
+        *,
+        hold_position: Coordinate | None = None,
+        patrol_altitude: float | None = None,
+    ) -> list[UrbanAction]:
+        """Fallback when patrol was skipped: GOTO anchor, then HOLD (ordered batch)."""
+        del patrol_altitude  # hold_position supersedes when provided by caller
+        anchor = hold_position or _fire_hold_anchor(
+            incident,
+            Coordinate(incident.position.x, incident.position.y, incident.position.z),
+            15.0,
+        )
+        goto_actions = self._build_fire_hold_goto_actions(
+            state,
+            drone_ids,
+            anchor,
+            incident.id,
+            reason=f"goto above fire {incident.id} (no patrol leg)",
+        )
+        if not goto_actions:
+            return []
+        hold_actions = self._build_fire_hold_actions(
+            [action.target_id for action in goto_actions]
+        )
+        return goto_actions + hold_actions
 
     async def _wait_for_patrol_at_fire_anchor(
         self,
@@ -570,12 +638,35 @@ def _fire_hold_anchor(
     return Coordinate(incident.position.x, incident.position.y, hold_z)
 
 
+def _fire_hold_goto_anchor(
+    incident: Incident,
+    fire_watch: Coordinate,
+    patrol_altitude: float,
+) -> Coordinate:
+    anchor = _fire_hold_anchor(incident, fire_watch, patrol_altitude)
+    return Coordinate(
+        anchor.x + FIRE_HOLD_GOTO_X_OFFSET_M,
+        anchor.y,
+        anchor.z,
+    )
+
+
 def _coordinate_distance_3d(left: Coordinate, right: Coordinate) -> float:
     return math.sqrt(
         (left.x - right.x) ** 2
         + (left.y - right.y) ** 2
         + (left.z - right.z) ** 2
     )
+
+
+def _patrol_arrival_watch_drone_ids(patrol_drone_ids: list[str]) -> list[str]:
+    """Return the single drone ID used for post-fire arrival polling."""
+    watch = PATROL_ARRIVAL_WATCH_DRONE_ID
+    watch_key = watch.lower().replace("-", "")
+    for drone_id in patrol_drone_ids:
+        if drone_id.lower().replace("-", "") == watch_key:
+            return [drone_id]
+    return [watch]
 
 
 def _drone_at_fire_anchor(
