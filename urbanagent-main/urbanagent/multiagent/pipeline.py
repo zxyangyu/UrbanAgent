@@ -33,6 +33,7 @@ from urbanagent.multiagent.schemas import (
 )
 from urbanagent.multiagent.toolkit import SubAgentToolkit
 from urbanagent.multiagent.world_cache import WorldStateCache
+from urbanagent.fire_goto import offset_fire_hold_goto_position
 from urbanagent.sandbox import MockSandboxClient, SandboxClient
 from urbanagent.types import CityState, Coordinate, Incident, UrbanAction, UrbanResource
 
@@ -42,10 +43,6 @@ DEFAULT_FIRE_WATCH_XY = (25.3, 24.4)
 PATROL_ARRIVAL_EPS_M = 1
 # Only this UAV must reach hold_anchor before hold dispatch (s1_fire primary watch).
 PATROL_ARRIVAL_WATCH_DRONE_ID = "UAV-01"
-# GOTO hover point offset from incident xy (negative = west in CARLA +x east).
-FIRE_HOLD_GOTO_X_OFFSET_M = -13.0
-
-
 class UrbanMultiAgentSystem:
     """Meta + four sub-agents (MVP one each); ordered batch to sandbox + post-batch poll."""
 
@@ -644,11 +641,7 @@ def _fire_hold_goto_anchor(
     patrol_altitude: float,
 ) -> Coordinate:
     anchor = _fire_hold_anchor(incident, fire_watch, patrol_altitude)
-    return Coordinate(
-        anchor.x + FIRE_HOLD_GOTO_X_OFFSET_M,
-        anchor.y,
-        anchor.z,
-    )
+    return offset_fire_hold_goto_position(anchor)
 
 
 def _coordinate_distance_3d(left: Coordinate, right: Coordinate) -> float:
